@@ -1,0 +1,100 @@
+name: 🚀 Release
+
+# Builds, signs, and publishes an immutable GitHub Release with
+# plugin_package.zip + plugin_package.zip.sig
+#
+# Prerequisites:
+#   1. Repository secret PRIVATE_KEY = full contents of private.pem (Ed25519)
+#   2. Settings → General → Releases → enable "Immutable releases"
+#   3. Run from the main branch: Actions → 🚀 Release → Run workflow
+#
+# Version is read from caido.config.ts via the built manifest.json.
+
+on:
+  workflow_dispatch:
+    inputs:
+      prerelease:
+        description: "Mark as pre-release?"
+        required: false
+        default: false
+        type: boolean
+
+env:
+  NODE_VERSION: "20"
+  PNPM_VERSION: "9"
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Verify main branch
+        run: |
+          if [[ "${{ github.ref_name }}" != "main" ]]; then
+            echo "Release can only be done on the main branch (current: ${{ github.ref_name }})."
+            exit 1
+          fi
+
+      - name: Checkout project
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          run_install: true
+
+      - name: Build package
+        run: pnpm build
+
+      - name: Sign package
+        working-directory: dist
+        run: |
+          if [[ -z "${{ secrets.PRIVATE_KEY }}" ]]; then
+            echo "::error::Set an Ed25519 key as the PRIVATE_KEY repository secret."
+            echo "Generate with: openssl genpkey -algorithm ed25519 -out private.pem"
+            exit 1
+          fi
+          echo "${{ secrets.PRIVATE_KEY }}" > private_key.pem
+          openssl pkeyutl -sign -inkey private_key.pem -out plugin_package.zip.sig -rawin -in plugin_package.zip
+          rm -f private_key.pem
+          ls -la plugin_package.zip plugin_package.zip.sig
+
+      - name: Read version from manifest
+        id: meta
+        working-directory: dist
+        run: |
+          VERSION=$(unzip -p plugin_package.zip manifest.json | jq -r .version)
+          if [[ -z "$VERSION" || "$VERSION" == "null" ]]; then
+            echo "::error::Could not read version from manifest.json"
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Releasing version ${VERSION}"
+
+      - name: Create GitHub Release
+        uses: caido/action-release@v1
+        with:
+          prerelease: ${{ inputs.prerelease }}
+          tag: ${{ steps.meta.outputs.version }}
+          commit: ${{ github.sha }}
+          body: |
+            ## Path Crawler ${{ steps.meta.outputs.version }}
+
+            ### Install
+            1. Download `plugin_package.zip` below (or install from the Caido Store once published)
+            2. Caido → **Plugins** → **Install from file**
+
+            ### Artifacts
+            - `plugin_package.zip` — installable plugin package
+            - `plugin_package.zip.sig` — Ed25519 signature
+          artifacts: "dist/plugin_package.zip,dist/plugin_package.zip.sig"
+          immutableCreate: true

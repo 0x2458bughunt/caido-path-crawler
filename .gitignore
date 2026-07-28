@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+packages/*/dist/
+*.zip
+!docs/**
+
+# Logs & OS
+*.log
+.DS_Store
+Thumbs.db
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# TypeScript
+*.tsbuildinfo
+coverage/
+
+# ── Signing keys (NEVER commit the private key) ─────────────────────────────
+# public.pem IS committed (used for Caido Store verification)
+private.pem
+public_key.b64
+keys/
+secrets/
