@@ -20,7 +20,7 @@ on:
         type: boolean
 
 env:
-  NODE_VERSION: "20"
+  NODE_VERSION: "24"
   PNPM_VERSION: "9"
 
 jobs:
@@ -39,10 +39,10 @@ jobs:
           fi
 
       - name: Checkout project
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: ${{ env.NODE_VERSION }}
 
@@ -57,13 +57,17 @@ jobs:
 
       - name: Sign package
         working-directory: dist
+        env:
+          PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
         run: |
-          if [[ -z "${{ secrets.PRIVATE_KEY }}" ]]; then
+          if [[ -z "${PRIVATE_KEY}" ]]; then
             echo "::error::Set an Ed25519 key as the PRIVATE_KEY repository secret."
-            echo "Generate with: openssl genpkey -algorithm ed25519 -out private.pem"
+            echo "From your machine:  gh secret set PRIVATE_KEY < private.pem"
             exit 1
           fi
-          echo "${{ secrets.PRIVATE_KEY }}" > private_key.pem
+          # Write key without leaking it in logs; support keys stored with or without trailing newline
+          printf '%s\n' "$PRIVATE_KEY" > private_key.pem
+          chmod 600 private_key.pem
           openssl pkeyutl -sign -inkey private_key.pem -out plugin_package.zip.sig -rawin -in plugin_package.zip
           rm -f private_key.pem
           ls -la plugin_package.zip plugin_package.zip.sig
