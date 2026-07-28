@@ -277,17 +277,6 @@ Use only on systems you are authorized to test.
 
 ---
 
-## Roadmap ideas
-
-- [ ] Scope-aware filtering (honor Caido scopes)  
-- [ ] Send path → Replay / Automate from context menu  
-- [ ] Export JSON / CSV in addition to Markdown  
-- [ ] Collapse query-string variants  
-
-PRs and issues welcome.
-
----
-
 ## Contributing
 
 1. Fork and create a feature branch  
@@ -295,21 +284,6 @@ PRs and issues welcome.
 3. Run `pnpm typecheck` and `pnpm build` before opening a PR  
 4. Describe the behavior change clearly (screenshots help for UI)
 
----
-
-## Publishing (GitHub + Caido Store)
-
-Path Crawler is packaged for the official [Caido Store](https://github.com/caido/store).
-
-| Step | What to do |
-|------|------------|
-| 1 | Push this repo to GitHub |
-| 2 | Enable **Immutable releases** (Settings → General → Releases) |
-| 3 | Add secret **`PRIVATE_KEY`** = contents of local `private.pem` (gitignored) |
-| 4 | Run **Actions → 🚀 Release** on `main` |
-| 5 | PR the entry in [`store/plugin_packages.entry.json`](store/plugin_packages.entry.json) into [caido/store](https://github.com/caido/store/edit/main/plugin_packages.json) |
-
-Full walkthrough (signing, CLA, review cycle): **[docs/PUBLISHING.md](docs/PUBLISHING.md)**
 
 ```
 Plugin ID:     path-crawler
