@@ -4,6 +4,7 @@ import type { API, BackendEvents } from "backend";
 export type FrontendSDK = Caido<API, BackendEvents>;
 
 export type {
+  CrawlStatus,
   CrawlTree,
   CrawlUpdate,
   DomainGroup,
@@ -12,4 +13,6 @@ export type {
   JsPathEntry,
   PathEntry,
   Result,
+  ScopeOption,
+  Settings,
 } from "backend";

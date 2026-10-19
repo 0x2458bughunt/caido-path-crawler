@@ -178,10 +178,20 @@ function domainItemCount(d: DomainGroup): number {
 }
 
 function sourceBadge(source: string): string {
-  if (source === "html") {
-    return "HTML";
+  return { html: "HTML", js: "JS", crawl: "CRAWL" }[source] ?? "REQ";
+}
+
+function statusClass(status: number): string {
+  if (status < 300) {
+    return "bg-green-900/40 text-green-300";
   }
-  return "REQ";
+  if (status < 400) {
+    return "bg-blue-900/40 text-blue-300";
+  }
+  if (status === 401 || status === 403) {
+    return "bg-yellow-900/40 text-yellow-300";
+  }
+  return "bg-surface-700 text-surface-400";
 }
 
 function onDeleteHost(event: Event, host: string): void {
@@ -205,7 +215,7 @@ function onDeleteDomain(event: Event, root: string): void {
       <p class="text-center">
         No paths discovered yet.<br />
         <span class="text-xs"
-          >Browse sites through Caido — every request is crawled automatically.</span
+          >Pick a scope, then browse in-scope sites through Caido or hit Crawl.</span
         >
       </p>
     </div>
@@ -317,6 +327,13 @@ function onDeleteDomain(event: Event, root: string): void {
               <i class="fas fa-link text-xs text-surface-500 w-3" />
               <span class="text-surface-200 truncate flex-1" :title="p.path">{{ p.path }}</span>
               <span
+                v-if="p.status !== undefined"
+                class="text-[10px] px-1.5 py-0.5 rounded tabular-nums"
+                :class="statusClass(p.status)"
+              >
+                {{ p.status }}
+              </span>
+              <span
                 class="text-[10px] px-1.5 py-0.5 rounded bg-surface-700 text-surface-300 uppercase tracking-wide"
               >
                 {{ p.method }}
@@ -324,9 +341,9 @@ function onDeleteDomain(event: Event, root: string): void {
               <span
                 class="text-[10px] px-1.5 py-0.5 rounded uppercase tracking-wide"
                 :class="
-                  p.source === 'html'
-                    ? 'bg-secondary-900/40 text-secondary-300'
-                    : 'bg-primary-900/40 text-primary-300'
+                  p.source === 'request'
+                    ? 'bg-primary-900/40 text-primary-300'
+                    : 'bg-secondary-900/40 text-secondary-300'
                 "
               >
                 {{ sourceBadge(p.source) }}

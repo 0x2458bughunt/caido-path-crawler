@@ -1,8 +1,8 @@
 # Path Crawler
 
-**Passive path discovery for [Caido](https://caido.io)** — a Burp-style site map that grows from real traffic.
+**Scope-aware path discovery for [Caido](https://caido.io)** — a Burp-style site map that grows from real traffic, plus an optional active crawl.
 
-Every request you proxy, every HTML link, and every JavaScript file is mined for paths, then organized into an expandable tree by root domain and host.
+Every **in-scope** request you proxy, every HTML link, and every JavaScript file is mined for paths, then organized into an expandable tree by root domain and host. Hit **Crawl** to actively request the paths you haven't visited yet — still in-scope only.
 
 <p align="center">
   <img alt="Caido" src="https://img.shields.io/badge/Caido-Plugin-a0213e?style=flat-square" />
@@ -40,6 +40,14 @@ During an engagement you visit pages, the browser fires a waterfall of XHR/fetch
 - **Per-host children** with paths and expandable JS files
 - **CDN / cloud storage awareness** with referer labels (see below)
 
+### Scope & active crawl
+- **In-scope only** — pick a Caido scope in the toolbar. Until you do, nothing is recorded and nothing is requested. Out-of-scope traffic, links and JS references are ignored, and every active request is re-checked against the scope right before it is sent
+- **Crawl / Stop** — GETs every unvisited in-scope path (from traffic, HTML, redirects and JS), follows new links up to the configured depth, and records the response status on each path
+- **Guard rails** (⚙ settings): max depth, max requests per run, requests/second, exclude regex (default skips `logout|delete|remove|destroy|reset|…`), and static assets / templated routes (`/user/${id}`, `/:id`) are never requested
+- Active requests reuse the `Cookie` / `Authorization` / `User-Agent` from your latest proxied request to that host, so authenticated areas get crawled
+- Crawl requests are **not** saved to HTTP history unless you enable it in settings
+- Relative links resolve properly (`<base href>`, `../`, protocol-relative), and absolute URLs are filed under their real host
+
 ### Workflow
 - Live updates as traffic flows (no manual refresh required)
 - Filter by domain, host, path, or referer
@@ -72,8 +80,10 @@ During an engagement you visit pages, the browser fires a waterfall of XHR/fetch
 | Badge | Meaning |
 |-------|---------|
 | **REQ** | Seen as a real proxied request |
-| **HTML** | Discovered from HTML attributes / inline script |
+| **HTML** | Discovered from HTML attributes / inline script / redirect |
 | **JS** | Extracted from a JavaScript file body |
+| **CRAWL** | Found and requested by the active crawl |
+| **200 / 302 / 403…** | Last response status seen for the path |
 | **[ABC.COM]** | CDN/cloud host was loaded by this site (Referer or Origin) |
 | **CDN** | Root domain is a known CDN / object-storage family |
 | **fetching…** | Active one-shot JS request in progress |
@@ -228,6 +238,7 @@ Bodies larger than ~2MB are truncated for performance.
 pnpm install
 pnpm watch          # rebuild on change
 pnpm typecheck      # tsc + vue-tsc
+pnpm check          # URL resolution / extraction self-check
 pnpm build          # production → dist/plugin_package.zip
 ```
 
@@ -268,9 +279,10 @@ caido-path-crawler/
 
 ## Privacy & safety
 
-- **Passive by default** for browsing traffic you already proxy  
-- **One active request per discovered JS file** (same host/path is never re-fetched for extraction)  
-- No telemetry, no external network calls except those active JS GETs to targets already in your traffic  
+- **In-scope only**: no scope selected → no recording, no requests  
+- **Passive by default**; the only automatic active requests are one GET per discovered in-scope JS file  
+- **Active crawl only when you press Crawl** — GET only, rate-limited, capped, exclude regex applied  
+- No telemetry, no external network calls except those in-scope GETs  
 - All data stays in Caido’s local plugin database for the current project  
 
 Use only on systems you are authorized to test.

@@ -1,16 +1,22 @@
 <script setup lang="ts">
 import Button from "primevue/button";
 import Card from "primevue/card";
+import Checkbox from "primevue/checkbox";
+import InputNumber from "primevue/inputnumber";
 import InputText from "primevue/inputtext";
+import Select from "primevue/select";
 import { computed, onMounted, ref } from "vue";
 
 import { CrawlTree } from "@/components/CrawlTree";
 import { useSDK } from "@/plugins/sdk";
 import type {
+  CrawlStatus,
   CrawlTree as CrawlTreeData,
   CrawlUpdate,
   DomainGroup,
   HostNode,
+  ScopeOption,
+  Settings,
 } from "@/types";
 import { confirmDialog } from "@/utils/confirm";
 
@@ -25,6 +31,62 @@ const filter = ref("");
 const loading = ref(true);
 const exporting = ref(false);
 const treeRef = ref<InstanceType<typeof CrawlTree> | null>(null);
+const scopes = ref<ScopeOption[]>([]);
+const settings = ref<Settings | undefined>(undefined);
+const crawl = ref<CrawlStatus | undefined>(undefined);
+const showSettings = ref(false);
+
+const crawlLabel = computed(() => {
+  const c = crawl.value;
+  if (c === undefined || (!c.running && c.sent === 0)) {
+    return "";
+  }
+  const errors = c.errors > 0 ? ` · ${c.errors} errors` : "";
+  return `${c.running ? "Crawling" : "Done"}: ${c.sent}/${c.maxRequests} sent · ${c.queued} queued${errors}`;
+});
+
+async function loadSettings(): Promise<void> {
+  const [s, sc, st] = await Promise.all([
+    sdk.backend.getSettings(),
+    sdk.backend.getScopes(),
+    sdk.backend.getCrawlStatus(),
+  ]);
+  if (s.kind === "Ok") {
+    settings.value = s.value;
+  }
+  if (sc.kind === "Ok") {
+    scopes.value = sc.value;
+  }
+  if (st.kind === "Ok") {
+    crawl.value = st.value;
+  }
+}
+
+async function updateSettings(patch: Partial<Settings>): Promise<void> {
+  const result = await sdk.backend.setSettings(patch);
+  if (result.kind === "Error") {
+    sdk.window.showToast(result.error, { variant: "error" });
+    return;
+  }
+  settings.value = result.value;
+}
+
+async function onToggleCrawl(): Promise<void> {
+  const result =
+    crawl.value?.running === true
+      ? await sdk.backend.stopCrawl()
+      : await sdk.backend.startCrawl();
+  if (result.kind === "Error") {
+    sdk.window.showToast(result.error, { variant: "error" });
+    return;
+  }
+  crawl.value = result.value;
+  if (!result.value.running && result.value.sent === 0) {
+    sdk.window.showToast("Nothing to crawl — every in-scope path is already visited", {
+      variant: "info",
+    });
+  }
+}
 
 const statsLabel = computed(() => {
   return `${domains.value.length} domains · ${totalHosts.value} hosts · ${totalPaths.value} paths · ${totalJsFiles.value} JS · ${totalJsPaths.value} in-JS`;
@@ -137,6 +199,7 @@ function applyUpdate(u: CrawlUpdate): void {
           method: u.method ?? "GET",
           source: u.source ?? "request",
           firstSeen: u.firstSeen,
+          status: u.status,
         },
       ].sort((a, b) => a.path.localeCompare(b.path));
       totalPaths.value += 1;
@@ -149,6 +212,7 @@ function applyUpdate(u: CrawlUpdate): void {
           ...p,
           method: u.method ?? p.method,
           source: u.source ?? p.source,
+          status: u.status ?? p.status,
         };
       });
     }
@@ -296,6 +360,11 @@ async function onExportMd(): Promise<void> {
 
 onMounted(() => {
   void loadTree();
+  void loadSettings();
+
+  sdk.backend.onEvent("crawl-status", (status: CrawlStatus) => {
+    crawl.value = status;
+  });
 
   sdk.backend.onEvent("crawl-updated", (updates: CrawlUpdate[]) => {
     for (const u of updates) {
@@ -333,6 +402,36 @@ onMounted(() => {
           </span>
 
           <div class="flex-1" />
+
+          <Select
+            :model-value="settings?.scopeId"
+            :options="scopes"
+            option-label="name"
+            option-value="id"
+            placeholder="Pick a scope…"
+            size="small"
+            class="w-48"
+            title="Only hosts in this Caido scope are recorded and crawled"
+            @update:model-value="(id: string) => updateSettings({ scopeId: id })"
+            @show="loadSettings"
+          />
+          <Button
+            :icon="crawl?.running ? 'fas fa-stop' : 'fas fa-play'"
+            :label="crawl?.running ? 'Stop' : 'Crawl'"
+            :severity="crawl?.running ? 'danger' : 'primary'"
+            size="small"
+            :disabled="settings?.scopeId === undefined"
+            title="Actively GET unvisited in-scope paths (rate-limited, excludes apply)"
+            @click="onToggleCrawl"
+          />
+          <Button
+            icon="fas fa-cog"
+            severity="secondary"
+            size="small"
+            text
+            title="Crawler settings"
+            @click="showSettings = !showSettings"
+          />
 
           <span class="p-input-icon-left">
             <i class="fas fa-search" />
@@ -385,6 +484,77 @@ onMounted(() => {
             text
             @click="onClearAll"
           />
+        </div>
+
+        <!-- Settings -->
+        <div
+          v-if="showSettings && settings !== undefined"
+          class="flex flex-wrap items-center gap-4 px-4 py-2 border-b border-surface-600 bg-surface-800 text-xs text-surface-300"
+        >
+          <label class="flex items-center gap-2">
+            Depth
+            <InputNumber
+              :model-value="settings.maxDepth"
+              :min="0"
+              :max="10"
+              size="small"
+              input-class="w-14"
+              @update:model-value="(v: number) => updateSettings({ maxDepth: v })"
+            />
+          </label>
+          <label class="flex items-center gap-2">
+            Max requests
+            <InputNumber
+              :model-value="settings.maxRequests"
+              :min="1"
+              size="small"
+              input-class="w-20"
+              @update:model-value="(v: number) => updateSettings({ maxRequests: v })"
+            />
+          </label>
+          <label class="flex items-center gap-2">
+            Req/s
+            <InputNumber
+              :model-value="settings.rps"
+              :min="0.1"
+              :max="50"
+              :max-fraction-digits="1"
+              size="small"
+              input-class="w-14"
+              @update:model-value="(v: number) => updateSettings({ rps: v })"
+            />
+          </label>
+          <label class="flex items-center gap-2 flex-1 min-w-64">
+            Exclude regex
+            <InputText
+              :model-value="settings.exclude"
+              size="small"
+              class="flex-1 font-mono"
+              @change="(e: Event) => updateSettings({ exclude: (e.target as HTMLInputElement).value })"
+            />
+          </label>
+          <label class="flex items-center gap-2">
+            <Checkbox
+              :model-value="settings.saveHistory"
+              binary
+              @update:model-value="(v: boolean) => updateSettings({ saveHistory: v })"
+            />
+            Save crawl requests to HTTP history
+          </label>
+        </div>
+
+        <div
+          v-if="settings !== undefined && settings.scopeId === undefined"
+          class="px-4 py-2 text-xs text-yellow-300 bg-surface-800 border-b border-surface-600"
+        >
+          <i class="fas fa-exclamation-triangle mr-1" />
+          Nothing is recorded or requested until you pick a scope.
+        </div>
+        <div
+          v-else-if="crawlLabel.length > 0"
+          class="px-4 py-1 text-xs text-surface-400 tabular-nums bg-surface-800 border-b border-surface-600"
+        >
+          {{ crawlLabel }}
         </div>
 
         <!-- Tree -->
