@@ -6,11 +6,13 @@ import { extractRefererLabel, isCloudAssetHost } from "./cdn";
 import { getRootDomain } from "./domain";
 import {
   contentTypeOf,
-  extractPathsFromHtml,
-  extractPathsFromJs,
+  extractFromHtml,
+  extractRefsFromJs,
   isHtmlContent,
   isJsPath,
-  normalizePath,
+  isLikelyAssetPath,
+  pathOf,
+  resolveRef,
 } from "./extract";
 import {
   addJsFile,
@@ -21,14 +23,28 @@ import {
   clearHost,
   clearRootDomain,
   exportMarkdown,
+  getCrawlSeeds,
   getTree,
   initStore,
   isJsFetched,
+  isVisited,
+  loadSettings,
   markJsFetched,
+  saveSettings,
+  setStatus,
 } from "./store";
-import type { CrawlTree, CrawlUpdate, Result } from "./types";
+import type {
+  CrawlStatus,
+  CrawlTree,
+  CrawlUpdate,
+  PathSource,
+  Result,
+  ScopeOption,
+  Settings,
+} from "./types";
 
 export type {
+  CrawlStatus,
   CrawlTree,
   CrawlUpdate,
   DomainGroup,
@@ -36,34 +52,87 @@ export type {
   JsFileEntry,
   JsPathEntry,
   PathEntry,
+  PathSource,
   Result,
+  ScopeOption,
+  Settings,
 } from "./types";
 
-// ── Connection memory (for active JS fetches) ────────────────────────────────
-
-type ConnInfo = {
-  hostname: string;
-  port: number;
-  tls: boolean;
+const DEFAULT_SETTINGS: Settings = {
+  scopeId: undefined,
+  maxDepth: 3,
+  maxRequests: 500,
+  rps: 5,
+  exclude: "log-?out|sign-?out|delete|remove|destroy|unsubscribe|deactivate|revoke|reset",
+  saveHistory: false,
 };
 
-/** hostKey → last seen connection details */
-const hostConns = new Map<string, ConnInfo>();
+/** Concurrent in-flight active requests */
+const MAX_IN_FLIGHT = 4;
 
-/** In-flight / completed active JS fetches this session: hostKey|path */
-const jsFetchState = new Set<string>();
+let settings: Settings = DEFAULT_SETTINGS;
+let excludeRe = new RegExp(DEFAULT_SETTINGS.exclude, "i");
+
+/** hostKey → scheme://authority last seen in traffic (hosts default to https) */
+const origins = new Map<string, string>();
+
+/** hostKey → session headers from the latest proxied request, replayed on active requests */
+const sessions = new Map<string, Record<string, string>>();
+
+type Job = { url: URL; depth: number; js: boolean };
+
+const queue: Job[] = [];
+/** host|path keys queued or sent this session (DB flags cover restarts) */
+const queued = new Set<string>();
+const run = { running: false, sent: 0, errors: 0 };
+let inFlight = 0;
+let pumping = false;
+let lastSent = 0;
+
+type PluginSDK = SDK<API, BackendEvents>;
+
+// ── Scope ────────────────────────────────────────────────────────────────────
+
+function scopeOk(sdk: PluginSDK, target: Request | RequestSpec | string): boolean {
+  if (settings.scopeId === undefined) {
+    return false;
+  }
+  try {
+    const req = typeof target === "string" ? new RequestSpec(target) : target;
+    return sdk.requests.inScope(req, [settings.scopeId]);
+  } catch {
+    return false;
+  }
+}
+
+function originOf(host: string): string {
+  return origins.get(host) ?? `https://${host}`;
+}
+
+function hostInScope(sdk: PluginSDK, host: string): boolean {
+  return scopeOk(sdk, `${originOf(host)}/`);
+}
 
 // ── API ──────────────────────────────────────────────────────────────────────
 
-async function getCrawlTree(_sdk: SDK): Promise<Result<CrawlTree>> {
-  const tree = await getTree();
+async function getCrawlTree(sdk: SDK): Promise<Result<CrawlTree>> {
+  const s = sdk as PluginSDK;
+  const tree = await getTree((h) => hostInScope(s, h));
   return { kind: "Ok", value: tree };
+}
+
+function forgetQueued(host: string | undefined): void {
+  for (const key of [...queued]) {
+    if (host === undefined || key.startsWith(`${host}|`)) {
+      queued.delete(key);
+    }
+  }
 }
 
 async function clearCrawlData(sdk: SDK): Promise<Result<void>> {
   const result = await clearAll();
   if (result.kind === "Ok") {
-    jsFetchState.clear();
+    forgetQueued(undefined);
     (sdk as PluginSDK).api.send("crawl-cleared", undefined);
   }
   return result;
@@ -75,12 +144,7 @@ async function clearCrawlHost(sdk: SDK, host: string): Promise<Result<void>> {
   }
   const result = await clearHost(host);
   if (result.kind === "Ok") {
-    // Drop fetch state for this host
-    for (const key of [...jsFetchState]) {
-      if (key.startsWith(`${host}|`)) {
-        jsFetchState.delete(key);
-      }
-    }
+    forgetQueued(host);
     (sdk as PluginSDK).api.send("crawl-cleared", host);
   }
   return result;
@@ -95,15 +159,92 @@ async function clearCrawlRootDomain(
   }
   const result = await clearRootDomain(rootDomain);
   if (result.kind === "Ok") {
-    jsFetchState.clear();
+    forgetQueued(undefined);
     (sdk as PluginSDK).api.send("crawl-cleared", rootDomain);
   }
   return result;
 }
 
-async function exportCrawlMarkdown(_sdk: SDK): Promise<Result<string>> {
-  const md = await exportMarkdown();
+async function exportCrawlMarkdown(sdk: SDK): Promise<Result<string>> {
+  const s = sdk as PluginSDK;
+  const md = await exportMarkdown((h) => hostInScope(s, h));
   return { kind: "Ok", value: md };
+}
+
+async function getScopes(sdk: SDK): Promise<Result<ScopeOption[]>> {
+  const scopes = await sdk.scope.getAll();
+  return { kind: "Ok", value: scopes.map((s) => ({ id: s.id, name: s.name })) };
+}
+
+function getSettings(_sdk: SDK): Result<Settings> {
+  return { kind: "Ok", value: settings };
+}
+
+async function setSettings(sdk: SDK, patch: Partial<Settings>): Promise<Result<Settings>> {
+  const next: Settings = { ...settings, ...patch };
+  let re: RegExp;
+  try {
+    re = new RegExp(next.exclude, "i");
+  } catch (err) {
+    return { kind: "Error", error: `Invalid exclude regex: ${String(err)}` };
+  }
+  next.maxDepth = Math.max(0, Math.min(10, Math.floor(next.maxDepth)));
+  next.maxRequests = Math.max(1, Math.min(100_000, Math.floor(next.maxRequests)));
+  next.rps = Math.max(0.1, Math.min(50, next.rps));
+
+  const scopeChanged = next.scopeId !== settings.scopeId;
+  settings = next;
+  excludeRe = re;
+  await saveSettings(next);
+
+  if (scopeChanged) {
+    stopRun(sdk as PluginSDK);
+    queue.length = 0;
+    (sdk as PluginSDK).api.send("crawl-cleared", undefined);
+  }
+  return { kind: "Ok", value: settings };
+}
+
+function status(): CrawlStatus {
+  return {
+    running: run.running,
+    sent: run.sent,
+    queued: queue.length,
+    errors: run.errors,
+    maxRequests: settings.maxRequests,
+  };
+}
+
+function getCrawlStatus(_sdk: SDK): Result<CrawlStatus> {
+  return { kind: "Ok", value: status() };
+}
+
+async function startCrawl(sdk: SDK): Promise<Result<CrawlStatus>> {
+  const s = sdk as PluginSDK;
+  if (settings.scopeId === undefined) {
+    return { kind: "Error", error: "Pick a scope first" };
+  }
+  if (run.running) {
+    return { kind: "Ok", value: status() };
+  }
+  run.running = true;
+  run.sent = 0;
+  run.errors = 0;
+
+  for (const { host, path } of await getCrawlSeeds()) {
+    const url = resolveRef(path, `${originOf(host)}/`);
+    if (url !== undefined) {
+      await enqueue(s, url, 0, isJsPath(path, undefined));
+    }
+  }
+  finishIfIdle(s);
+  emitStatus(s);
+  return { kind: "Ok", value: status() };
+}
+
+function stopCrawl(sdk: SDK): Result<CrawlStatus> {
+  stopRun(sdk as PluginSDK);
+  return { kind: "Ok", value: status() };
 }
 
 export type API = DefineAPI<{
@@ -112,41 +253,21 @@ export type API = DefineAPI<{
   clearCrawlHost: typeof clearCrawlHost;
   clearCrawlRootDomain: typeof clearCrawlRootDomain;
   exportCrawlMarkdown: typeof exportCrawlMarkdown;
+  getScopes: typeof getScopes;
+  getSettings: typeof getSettings;
+  setSettings: typeof setSettings;
+  getCrawlStatus: typeof getCrawlStatus;
+  startCrawl: typeof startCrawl;
+  stopCrawl: typeof stopCrawl;
 }>;
 
 export type BackendEvents = DefineEvents<{
   "crawl-updated": (updates: CrawlUpdate[]) => void;
   "crawl-cleared": (host: string | undefined) => void;
+  "crawl-status": (status: CrawlStatus) => void;
 }>;
 
-type PluginSDK = SDK<API, BackendEvents>;
-
 // ── Helpers ──────────────────────────────────────────────────────────────────
-
-function hostKey(request: Request): string {
-  const host = request.getHost();
-  const port = request.getPort();
-  const tls = request.getTls();
-  const defaultPort = tls ? 443 : 80;
-  if (port === defaultPort) {
-    return host;
-  }
-  return `${host}:${port}`;
-}
-
-function rememberConn(request: Request): string {
-  const key = hostKey(request);
-  hostConns.set(key, {
-    hostname: request.getHost(),
-    port: request.getPort(),
-    tls: request.getTls(),
-  });
-  return key;
-}
-
-function responseContentType(response: Response): string | undefined {
-  return contentTypeOf(response.getHeaders());
-}
 
 function emit(sdk: PluginSDK, updates: CrawlUpdate[]): void {
   if (updates.length === 0) {
@@ -155,181 +276,298 @@ function emit(sdk: PluginSDK, updates: CrawlUpdate[]): void {
   sdk.api.send("crawl-updated", updates);
 }
 
-function jsStateKey(host: string, path: string): string {
-  return `${host}|${path}`;
+function emitStatus(sdk: PluginSDK): void {
+  sdk.api.send("crawl-status", status());
 }
 
-function buildJsUrl(conn: ConnInfo, path: string): string {
-  const scheme = conn.tls ? "https" : "http";
-  const defaultPort = conn.tls ? 443 : 80;
-  const authority =
-    conn.port === defaultPort ? conn.hostname : `${conn.hostname}:${conn.port}`;
-  // path should already start with /
-  return `${scheme}://${authority}${path}`;
+function rememberRequest(request: Request): string {
+  const url = new URL(request.getUrl());
+  origins.set(url.host, `${url.protocol}//${url.host}`);
+
+  const headers: Record<string, string> = {};
+  for (const name of ["Cookie", "Authorization", "User-Agent"]) {
+    const value = request.getHeader(name);
+    if (value !== undefined && value.length > 0) {
+      headers[name] = value.join(name === "Cookie" ? "; " : ", ");
+    }
+  }
+  // Merge: requests without cookies (CORS preflights, beacons) must not wipe the session
+  sessions.set(url.host, { ...sessions.get(url.host), ...headers });
+  return url.host;
 }
+
+/** Paths we never actively request: user excludes, static assets, templated routes. */
+function skipCrawl(path: string): boolean {
+  return excludeRe.test(path) || isLikelyAssetPath(path) || /[{}$<>]|\/:[a-z]/i.test(path);
+}
+
+// ── Active request queue ─────────────────────────────────────────────────────
 
 /**
- * Actively request a JS file once so we can parse its body for paths.
- * Skips if already fetched (DB) or an in-flight/session fetch exists.
+ * Queue an in-scope URL for an active GET.
+ * JS files are fetched once whenever discovered; pages only during a crawl run.
  */
-async function ensureJsFetched(
-  sdk: PluginSDK,
-  host: string,
-  path: string,
-  connHint?: ConnInfo,
-): Promise<void> {
-  const stateKey = jsStateKey(host, path);
-  if (jsFetchState.has(stateKey)) {
+async function enqueue(sdk: PluginSDK, url: URL, depth: number, js: boolean): Promise<void> {
+  const path = pathOf(url);
+  if (path === undefined) {
+    return;
+  }
+  const key = `${url.host}|${path}`;
+  if (queued.has(key) || !scopeOk(sdk, url.href)) {
+    return;
+  }
+  if (js) {
+    if (await isJsFetched(url.host, path)) {
+      return;
+    }
+  } else if (!run.running || depth > settings.maxDepth || skipCrawl(path)) {
+    return;
+  } else if (await isVisited(url.host, path)) {
     return;
   }
 
-  if (await isJsFetched(host, path)) {
-    jsFetchState.add(stateKey);
+  queued.add(key);
+  url.search = "";
+  url.hash = "";
+  queue.push({ url, depth, js });
+  void pump(sdk);
+}
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+async function pump(sdk: PluginSDK): Promise<void> {
+  if (pumping) {
     return;
   }
-
-  const conn = connHint ?? hostConns.get(host);
-  if (conn === undefined) {
-    // No connection info yet — wait until we see traffic to this host
-    return;
+  pumping = true;
+  while (queue.length > 0) {
+    while (inFlight >= MAX_IN_FLIGHT) {
+      await sleep(50);
+    }
+    const wait = lastSent + 1000 / settings.rps - Date.now();
+    if (wait > 0) {
+      await sleep(wait);
+    }
+    const job = queue.shift();
+    if (job === undefined) {
+      break;
+    }
+    lastSent = Date.now();
+    void send(sdk, job);
   }
+  pumping = false;
+}
 
-  jsFetchState.add(stateKey);
-
+async function send(sdk: PluginSDK, job: Job): Promise<void> {
+  inFlight += 1;
+  if (run.running) {
+    run.sent += 1;
+  }
   try {
-    const url = buildJsUrl(conn, path);
-    const spec = new RequestSpec(url);
+    const spec = new RequestSpec(job.url.href);
     spec.setMethod("GET");
-    spec.setHeader("Accept", "*/*");
-    spec.setHeader("User-Agent", "Caido-PathCrawler/1.0");
-
-    const result = await sdk.requests.send(spec);
-    const response = result.response;
-    if (response === undefined) {
-      jsFetchState.delete(stateKey);
+    spec.setHeader("Accept", job.js ? "*/*" : "text/html,application/xhtml+xml,*/*;q=0.8");
+    spec.setHeader("User-Agent", "Caido-PathCrawler/2.0");
+    for (const [name, value] of Object.entries(sessions.get(job.url.host) ?? {})) {
+      spec.setHeader(name, value);
+    }
+    // Last line of defence: the spec we actually send must be in scope
+    if (!scopeOk(sdk, spec)) {
       return;
     }
 
-    const body = response.getBody()?.toText();
-    if (body === undefined || body.length === 0) {
-      // Still mark attempted so we don't hammer; allow retry by not marking DB fetched
-      return;
-    }
-
-    await processJsBody(sdk, host, path, body);
+    const { response } = await sdk.requests.send(spec, {
+      timeouts: 20_000,
+      save: settings.saveHistory,
+    });
+    await ingest(sdk, job.url, response, job.depth, job.js ? undefined : "crawl");
   } catch (err) {
-    sdk.console.error(`JS fetch failed for ${host}${path}: ${String(err)}`);
-    jsFetchState.delete(stateKey);
+    run.errors += 1;
+    sdk.console.error(`Path Crawler: ${job.url.href} failed: ${String(err)}`);
+  } finally {
+    inFlight -= 1;
+    if (run.running && run.sent >= settings.maxRequests) {
+      stopRun(sdk);
+    }
+    finishIfIdle(sdk);
+    emitStatus(sdk);
   }
 }
 
-async function processJsBody(
-  sdk: PluginSDK,
-  host: string,
-  path: string,
-  body: string,
-): Promise<void> {
-  const updates: CrawlUpdate[] = [];
-
-  const { update: jsFileUpdate } = await addJsFile(host, path);
-  if (jsFileUpdate !== undefined) {
-    updates.push(jsFileUpdate);
+function stopRun(sdk: PluginSDK): void {
+  if (!run.running) {
+    return;
   }
-
-  const found = extractPathsFromJs(body);
-  for (const p of found) {
-    // Nested JS references → register + fetch once
-    if (isJsPath(p, undefined)) {
-      const nested = await addJsFile(host, p);
-      if (nested.update !== undefined) {
-        updates.push(nested.update);
-      }
-      if (!nested.alreadyFetched) {
-        void ensureJsFetched(sdk, host, p);
-      }
-      continue;
-    }
-    const u = await addJsPath(host, path, p);
-    if (u !== undefined) {
-      updates.push(u);
+  run.running = false;
+  // Drop pending pages; keep one-shot JS fetches
+  const js = queue.filter((j) => j.js);
+  for (const j of queue) {
+    if (!j.js) {
+      queued.delete(`${j.url.host}|${pathOf(j.url) ?? ""}`);
     }
   }
-
-  await markJsFetched(host, path);
-  jsFetchState.add(jsStateKey(host, path));
-
-  // Notify UI that this JS file is fully processed (even if no new paths)
-  updates.push({
-    host,
-    rootDomain: getRootDomain(host),
-    kind: "js-file",
-    path,
-    firstSeen: Date.now(),
-    fetched: true,
-  });
-
-  emit(sdk, updates);
+  queue.length = 0;
+  queue.push(...js);
+  emitStatus(sdk);
 }
 
-async function registerJsAndMaybeFetch(
-  sdk: PluginSDK,
-  host: string,
-  path: string,
-  connHint?: ConnInfo,
-): Promise<CrawlUpdate | undefined> {
-  const { update, alreadyFetched } = await addJsFile(host, path);
-  if (!alreadyFetched) {
-    void ensureJsFetched(sdk, host, path, connHint);
+function finishIfIdle(sdk: PluginSDK): void {
+  if (run.running && inFlight === 0 && !queue.some((j) => !j.js)) {
+    run.running = false;
+    emitStatus(sdk);
   }
-  return update;
 }
 
-// ── Interceptors ─────────────────────────────────────────────────────────────
+// ── Ingest (proxied + active responses) ──────────────────────────────────────
 
 /**
- * For CDN / cloud storage hosts, attach the page that loaded them (Referer → Origin).
+ * Record a response and mine its body for more paths.
+ * `source` is set when the URL itself should be stored as a path (crawl hits).
  */
-async function maybeRecordReferer(
-  request: Request,
-  host: string,
-): Promise<CrawlUpdate | undefined> {
-  if (!isCloudAssetHost(host)) {
-    return undefined;
+async function ingest(
+  sdk: PluginSDK,
+  url: URL,
+  response: Response,
+  depth: number,
+  source: PathSource | undefined,
+): Promise<void> {
+  const host = url.host;
+  const path = pathOf(url);
+  if (path === undefined) {
+    return;
   }
-  const label = extractRefererLabel(request.getHeaders(), host);
-  if (label === undefined) {
-    return undefined;
-  }
-  return addReferer(host, label);
-}
-
-async function handleRequest(sdk: PluginSDK, request: Request): Promise<void> {
-  const host = rememberConn(request);
-  const rawPath = request.getPath();
-  const method = request.getMethod();
-  const path = normalizePath(rawPath) ?? rawPath;
-  const conn = hostConns.get(host);
-
+  const ct = contentTypeOf(response.getHeaders());
+  const code = response.getCode();
   const updates: CrawlUpdate[] = [];
-
-  // Always try to capture who loaded this CDN host
-  const refUpdate = await maybeRecordReferer(request, host);
-  if (refUpdate !== undefined) {
-    updates.push(refUpdate);
-  }
-
-  if (isJsPath(path, undefined)) {
-    const u = await registerJsAndMaybeFetch(sdk, host, path, conn);
+  const push = (u: CrawlUpdate | undefined) => {
     if (u !== undefined) {
       updates.push(u);
     }
+  };
+
+  const js = isJsPath(path, ct);
+  if (source !== undefined && !js) {
+    push(await addPath(host, path, "GET", source));
+  }
+  if (!js) {
+    push(await setStatus(host, path, code));
+  }
+
+  const body = response.getBody()?.toText() ?? "";
+
+  if (js) {
+    const file = await addJsFile(host, path);
+    push(file.update);
+    if (body.length === 0 || code >= 400) {
+      // 304 / cached by the browser → fetch it ourselves once
+      if (source === undefined && code < 400) {
+        await enqueue(sdk, url, depth, true);
+      }
+      emit(sdk, updates);
+      return;
+    }
+    for (const raw of extractRefsFromJs(body)) {
+      await record(sdk, raw, url, depth, { host, jsFile: path }, push);
+    }
+    await markJsFetched(host, path);
+    push({
+      host,
+      rootDomain: getRootDomain(host),
+      kind: "js-file",
+      path,
+      firstSeen: Date.now(),
+      fetched: true,
+    });
     emit(sdk, updates);
     return;
   }
 
-  const pathUpdate = await addPath(host, path, method, "request");
-  if (pathUpdate !== undefined) {
-    updates.push(pathUpdate);
+  if (code >= 300 && code < 400) {
+    const location = response.getHeader("Location")?.[0];
+    if (location !== undefined) {
+      await record(sdk, location, url, depth, undefined, push);
+    }
+  } else if (isHtmlContent(ct, path) && body.length > 0) {
+    const html = extractFromHtml(body);
+    const base = (html.base === undefined ? undefined : resolveRef(html.base, url.href)) ?? url;
+    for (const raw of html.refs) {
+      await record(sdk, raw, base, depth, undefined, push);
+    }
+    for (const script of html.scripts) {
+      for (const raw of extractRefsFromJs(script)) {
+        await record(sdk, raw, base, depth, undefined, push);
+      }
+    }
+  }
+
+  emit(sdk, updates);
+}
+
+/**
+ * Resolve one discovered reference, store it if in scope, and queue it.
+ * `inJs` nests same-host paths under the JS file they were found in.
+ */
+async function record(
+  sdk: PluginSDK,
+  raw: string,
+  base: URL,
+  depth: number,
+  inJs: { host: string; jsFile: string } | undefined,
+  push: (u: CrawlUpdate | undefined) => void,
+): Promise<void> {
+  const url = resolveRef(raw, base.href);
+  if (url === undefined || !scopeOk(sdk, url.href)) {
+    return;
+  }
+  const path = pathOf(url);
+  if (path === undefined) {
+    return;
+  }
+
+  if (isJsPath(path, undefined)) {
+    push((await addJsFile(url.host, path)).update);
+    await enqueue(sdk, url, depth + 1, true);
+    return;
+  }
+
+  if (inJs !== undefined && inJs.host === url.host) {
+    push(await addJsPath(url.host, inJs.jsFile, path));
+  } else {
+    push(await addPath(url.host, path, "GET", inJs === undefined ? "html" : "js"));
+  }
+  await enqueue(sdk, url, depth + 1, false);
+}
+
+// ── Interceptors ─────────────────────────────────────────────────────────────
+
+async function handleRequest(sdk: PluginSDK, request: Request): Promise<void> {
+  if (!scopeOk(sdk, request)) {
+    return;
+  }
+  const host = rememberRequest(request);
+  const path = pathOf(new URL(request.getUrl()));
+  if (path === undefined) {
+    return;
+  }
+
+  const updates: CrawlUpdate[] = [];
+
+  // For in-scope CDN / cloud hosts, capture who loaded them (Referer → Origin)
+  if (isCloudAssetHost(host)) {
+    const label = extractRefererLabel(request.getHeaders(), host);
+    if (label !== undefined) {
+      const u = await addReferer(host, label);
+      if (u !== undefined) {
+        updates.push(u);
+      }
+    }
+  }
+
+  const u = isJsPath(path, undefined)
+    ? (await addJsFile(host, path)).update
+    : await addPath(host, path, request.getMethod(), "request");
+  if (u !== undefined) {
+    updates.push(u);
   }
 
   emit(sdk, updates);
@@ -340,80 +578,30 @@ async function handleResponse(
   request: Request,
   response: Response,
 ): Promise<void> {
-  const host = rememberConn(request);
-  const rawPath = request.getPath();
-  const path = normalizePath(rawPath) ?? rawPath;
-  const ct = responseContentType(response);
-  const body = response.getBody()?.toText();
-  const conn = hostConns.get(host);
-
-  if (body === undefined || body.length === 0) {
+  if (!scopeOk(sdk, request)) {
     return;
   }
-
-  // JavaScript response body (from browser or our active fetch)
-  if (isJsPath(path, ct)) {
-    // Mark in-flight so ensureJsFetched won't double-send if intercept wins the race
-    jsFetchState.add(jsStateKey(host, path));
-    await processJsBody(sdk, host, path, body);
-    return;
-  }
-
-  const updates: CrawlUpdate[] = [];
-
-  if (isHtmlContent(ct, path)) {
-    const found = extractPathsFromHtml(body);
-    for (const p of found) {
-      if (isJsPath(p, undefined)) {
-        const u = await registerJsAndMaybeFetch(sdk, host, p, conn);
-        if (u !== undefined) {
-          updates.push(u);
-        }
-        continue;
-      }
-      const u = await addPath(host, p, "GET", "html");
-      if (u !== undefined) {
-        updates.push(u);
-      }
-    }
-
-    const scriptRe = /<script\b[^>]*>([\s\S]*?)<\/script>/gi;
-    let m: RegExpExecArray | null;
-    while ((m = scriptRe.exec(body)) !== null) {
-      const scriptBody = m[1];
-      if (scriptBody === undefined || scriptBody.trim().length === 0) {
-        continue;
-      }
-      const jsPaths = extractPathsFromJs(scriptBody);
-      for (const p of jsPaths) {
-        if (isJsPath(p, undefined)) {
-          const u = await registerJsAndMaybeFetch(sdk, host, p, conn);
-          if (u !== undefined) {
-            updates.push(u);
-          }
-          continue;
-        }
-        const u = await addPath(host, p, "GET", "html");
-        if (u !== undefined) {
-          updates.push(u);
-        }
-      }
-    }
-  }
-
-  emit(sdk, updates);
+  await ingest(sdk, new URL(request.getUrl()), response, 0, undefined);
 }
 
 // ── Init ─────────────────────────────────────────────────────────────────────
 
 export async function init(sdk: PluginSDK): Promise<void> {
   await initStore(sdk);
+  settings = await loadSettings(DEFAULT_SETTINGS);
+  excludeRe = new RegExp(settings.exclude, "i");
 
   sdk.api.register("getCrawlTree", getCrawlTree);
   sdk.api.register("clearCrawlData", clearCrawlData);
   sdk.api.register("clearCrawlHost", clearCrawlHost);
   sdk.api.register("clearCrawlRootDomain", clearCrawlRootDomain);
   sdk.api.register("exportCrawlMarkdown", exportCrawlMarkdown);
+  sdk.api.register("getScopes", getScopes);
+  sdk.api.register("getSettings", getSettings);
+  sdk.api.register("setSettings", setSettings);
+  sdk.api.register("getCrawlStatus", getCrawlStatus);
+  sdk.api.register("startCrawl", startCrawl);
+  sdk.api.register("stopCrawl", stopCrawl);
 
   sdk.events.onInterceptRequest((s, request) => {
     void handleRequest(s as PluginSDK, request);
@@ -423,5 +611,5 @@ export async function init(sdk: PluginSDK): Promise<void> {
     void handleResponse(s as PluginSDK, request, response);
   });
 
-  sdk.console.log(`Path Crawler initialized (root grouping e.g. ${getRootDomain("test.abc.com")})`);
+  sdk.console.log("Path Crawler initialized (in-scope only)");
 }

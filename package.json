@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "typecheck": "pnpm -r typecheck",
+    "check": "node --experimental-strip-types packages/backend/test/extract.check.ts",
     "build": "caido-dev build",
     "watch": "caido-dev watch"
   },

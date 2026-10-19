@@ -10,79 +10,41 @@ const ASSET_EXT =
   /\.(?:png|jpe?g|gif|svg|webp|ico|woff2?|ttf|eot|map|css|less|scss|mp[34]|webm|avi|mov|pdf|zip|gz|tar|br)(?:\?|$)/i;
 
 /**
- * Normalize a discovered path:
- * - strip query/hash for storage key consistency of pure paths
- * - ensure leading slash for absolute paths
- * - reject junk / binary-looking values
+ * Clean a raw reference (HTML attribute / JS string) and resolve it against
+ * `base` — the page, JS file, or <base href> URL it was found in.
+ * Only http(s) URLs survive; data:/javascript:/mailto: etc. are dropped.
  */
-export function normalizePath(raw: string): string | undefined {
-  let p = raw.trim();
-  if (p.length === 0 || p.length > 2048) {
+export function resolveRef(raw: string, base: string): URL | undefined {
+  const p = raw
+    .trim()
+    .replace(/\\u002f/gi, "/")
+    .replace(/\\\//g, "/")
+    .replace(/^["'`]+|["'`]+$/g, "");
+  if (p.length === 0 || p.length > 2048 || /[\x00-\x1f\x7f\s]/.test(p)) {
     return undefined;
   }
-
-  // Drop protocol-relative and full URLs handled elsewhere
-  if (p.startsWith("//")) {
+  if (/^[a-z][a-z0-9+.-]*:/i.test(p) && !/^https?:/i.test(p)) {
     return undefined;
   }
-
-  // Decode common escapes from JS strings
-  p = p.replace(/\\u002f/gi, "/").replace(/\\\//g, "/");
-
-  // Strip surrounding quotes leftovers
-  p = p.replace(/^["'`]+|["'`]+$/g, "");
-
-  // Drop data:/javascript:/mailto:/tel: schemes
-  if (/^(?:data|javascript|mailto|tel|blob|about):/i.test(p)) {
+  try {
+    const url = new URL(p, base);
+    return url.protocol === "http:" || url.protocol === "https:" ? url : undefined;
+  } catch {
     return undefined;
   }
+}
 
-  // Full absolute URL → keep path only
-  if (/^https?:\/\//i.test(p)) {
-    try {
-      const u = new URL(p);
-      p = u.pathname + (u.search.length > 0 ? u.search : "");
-    } catch {
-      return undefined;
-    }
+/** Storage key for a URL: decoded pathname, repeated slashes collapsed, no query/fragment. */
+export function pathOf(url: URL): string | undefined {
+  let p = url.pathname.replace(/\/{2,}/g, "/");
+  try {
+    p = decodeURI(p);
+  } catch {
+    // keep encoded form
   }
-
-  // Relative paths like ./api or ../api → normalize to absolute-ish
-  if (p.startsWith("./")) {
-    p = "/" + p.slice(2);
-  } else if (p.startsWith("../")) {
-    p = "/" + p.replace(/^(\.\.\/)+/, "");
-  }
-
-  // Must look like a path
-  if (!p.startsWith("/")) {
+  if (/\/(?:null|undefined|NaN)$/.test(p)) {
     return undefined;
   }
-
-  // Reject pure root with nothing useful? keep "/" — useful.
-  // Reject control chars / whitespace
-  if (/[\x00-\x1f\x7f\s]/.test(p)) {
-    return undefined;
-  }
-
-  // Reject obvious noise
-  if (p === "/null" || p === "/undefined" || p === "/NaN") {
-    return undefined;
-  }
-
-  // Collapse repeated slashes
-  p = p.replace(/\/{2,}/g, "/");
-
-  // Drop fragment
-  const hashIdx = p.indexOf("#");
-  if (hashIdx !== -1) {
-    p = p.slice(0, hashIdx);
-  }
-
-  if (p.length === 0) {
-    return undefined;
-  }
-
   return p;
 }
 
@@ -112,28 +74,31 @@ export function isHtmlContent(contentType: string | undefined, path: string): bo
   return clean.endsWith(".html") || clean.endsWith(".htm") || clean === "/" || clean === "";
 }
 
-function pushPath(set: Set<string>, raw: string): void {
-  const n = normalizePath(raw);
-  if (n !== undefined) {
-    set.add(n);
-  }
-}
+export type HtmlRefs = {
+  /** Raw link values, unresolved */
+  refs: string[];
+  /** <base href> value, if present */
+  base: string | undefined;
+  /** Inline <script> bodies */
+  scripts: string[];
+};
 
 /**
- * Extract paths from HTML (href, src, action, formaction, data-*, srcset).
+ * Extract references from HTML (href, src, action, formaction, data-*, srcset),
+ * plus <base href> and inline scripts. Values are returned raw — resolve with resolveRef.
  */
-export function extractPathsFromHtml(body: string): string[] {
+export function extractFromHtml(body: string): HtmlRefs {
   const text = body.length > MAX_BODY_CHARS ? body.slice(0, MAX_BODY_CHARS) : body;
-  const found = new Set<string>();
+  const refs = new Set<string>();
 
-  // href / src / action / formaction / poster / data-url / data-href etc.
+  // Quoted or unquoted attribute values
   const attrRe =
-    /(?:href|src|action|formaction|poster|data-(?:url|href|src|path|endpoint|api))\s*=\s*(["'])(.*?)\1/gi;
+    /(?:href|src|action|formaction|poster|data-(?:url|href|src|path|endpoint|api))\s*=\s*(?:(["'])(.*?)\1|([^\s"'>]+))/gi;
   let m: RegExpExecArray | null;
   while ((m = attrRe.exec(text)) !== null) {
-    const val = m[2];
+    const val = m[2] ?? m[3];
     if (val !== undefined) {
-      pushPath(found, val);
+      refs.add(val);
     }
   }
 
@@ -146,21 +111,31 @@ export function extractPathsFromHtml(body: string): string[] {
     }
     for (const part of val.split(",")) {
       const url = part.trim().split(/\s+/)[0];
-      if (url !== undefined) {
-        pushPath(found, url);
+      if (url !== undefined && url.length > 0) {
+        refs.add(url);
       }
     }
   }
 
-  // Bare absolute paths in quotes inside inline scripts already handled by JS extractor if we call both.
-  return [...found];
+  const base = /<base\b[^>]*\bhref\s*=\s*["']?([^"'\s>]+)/i.exec(text)?.[1];
+
+  const scripts: string[] = [];
+  const scriptRe = /<script\b[^>]*>([\s\S]*?)<\/script>/gi;
+  while ((m = scriptRe.exec(text)) !== null) {
+    const src = m[1];
+    if (src !== undefined && src.trim().length > 0) {
+      scripts.push(src);
+    }
+  }
+
+  return { refs: [...refs], base, scripts };
 }
 
 /**
- * Extract path-like strings from JavaScript source.
+ * Extract path-like strings from JavaScript source (raw — resolve with resolveRef).
  * Covers: string literals, template literals, fetch/axios/XHR style URLs, route configs.
  */
-export function extractPathsFromJs(body: string): string[] {
+export function extractRefsFromJs(body: string): string[] {
   const text = body.length > MAX_BODY_CHARS ? body.slice(0, MAX_BODY_CHARS) : body;
   const found = new Set<string>();
 
@@ -170,9 +145,7 @@ export function extractPathsFromJs(body: string): string[] {
   while ((m = stringRe.exec(text)) !== null) {
     const val = m[2];
     if (val !== undefined) {
-      // Skip pure asset refs that are clearly static images fonts etc. inside JS? keep them —
-      // testers often want every path. Filter only obvious noise later if needed.
-      pushPath(found, val);
+      found.add(val);
     }
   }
 
@@ -181,7 +154,7 @@ export function extractPathsFromJs(body: string): string[] {
   while ((m = relRe.exec(text)) !== null) {
     const val = m[2];
     if (val !== undefined) {
-      pushPath(found, val);
+      found.add(val);
     }
   }
 
@@ -191,7 +164,7 @@ export function extractPathsFromJs(body: string): string[] {
   while ((m = callRe.exec(text)) !== null) {
     const val = m[2];
     if (val !== undefined) {
-      pushPath(found, val);
+      found.add(val);
     }
   }
 
@@ -200,19 +173,11 @@ export function extractPathsFromJs(body: string): string[] {
   while ((m = pathKeyRe.exec(text)) !== null) {
     const val = m[2];
     if (val !== undefined) {
-      pushPath(found, val);
+      found.add(val);
     }
   }
 
-  // Filter very noisy pure-asset-only discoveries? Keep; optional filter:
-  // Remove paths that are only "/." or single-char noise
-  return [...found].filter((p) => {
-    if (p.length < 2 && p !== "/") {
-      return false;
-    }
-    // Drop source maps path noise like huge base64 — already length limited
-    return true;
-  });
+  return [...found];
 }
 
 export function contentTypeOf(headers: Record<string, string[]> | undefined): string | undefined {

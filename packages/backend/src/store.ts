@@ -10,7 +10,9 @@ import type {
   JsFileEntry,
   JsPathEntry,
   PathEntry,
+  PathSource,
   Result,
+  Settings,
 } from "./types";
 
 type Database = Awaited<ReturnType<SDK["meta"]["db"]>>;
@@ -52,6 +54,11 @@ export async function initStore(sdk: SDK): Promise<void> {
       PRIMARY KEY (host, referer)
     );
 
+    CREATE TABLE IF NOT EXISTS crawl_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_crawl_paths_host ON crawl_paths(host);
     CREATE INDEX IF NOT EXISTS idx_crawl_js_files_host ON crawl_js_files(host);
     CREATE INDEX IF NOT EXISTS idx_crawl_js_paths_host ON crawl_js_paths(host);
@@ -64,6 +71,29 @@ export async function initStore(sdk: SDK): Promise<void> {
   } catch {
     // column already exists
   }
+  try {
+    await db.exec(`ALTER TABLE crawl_paths ADD COLUMN status INTEGER`);
+  } catch {
+    // column already exists
+  }
+}
+
+export async function loadSettings(defaults: Settings): Promise<Settings> {
+  const database = requireDb();
+  const stmt = await database.prepare("SELECT value FROM crawl_settings WHERE key = 'settings'");
+  const row = (await stmt.get()) as { value: string } | undefined;
+  if (row === undefined) {
+    return defaults;
+  }
+  return { ...defaults, ...(JSON.parse(row.value) as Partial<Settings>) };
+}
+
+export async function saveSettings(settings: Settings): Promise<void> {
+  const database = requireDb();
+  const stmt = await database.prepare(
+    "INSERT INTO crawl_settings (key, value) VALUES ('settings', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+  );
+  await stmt.run(JSON.stringify(settings));
 }
 
 function requireDb(): Database {
@@ -126,7 +156,7 @@ export async function addPath(
   host: string,
   path: string,
   method: string,
-  source: "request" | "html",
+  source: PathSource,
 ): Promise<CrawlUpdate | undefined> {
   const database = requireDb();
   const now = Date.now();
@@ -137,7 +167,7 @@ export async function addPath(
   const row = (await existing.get(host, path)) as { source: string } | undefined;
 
   if (row !== undefined) {
-    if (row.source === "html" && source === "request") {
+    if (row.source !== "request" && source === "request") {
       const upd = await database.prepare(
         "UPDATE crawl_paths SET source = ?, method = ? WHERE host = ? AND path = ?",
       );
@@ -152,6 +182,52 @@ export async function addPath(
   );
   await stmt.run(host, path, method, source, now);
   return withRoot({ host, kind: "path", path, method, source, firstSeen: now });
+}
+
+/** Record the response status for a known path (no-op if the path isn't stored). */
+export async function setStatus(
+  host: string,
+  path: string,
+  status: number,
+): Promise<CrawlUpdate | undefined> {
+  const database = requireDb();
+  const stmt = await database.prepare(
+    "UPDATE crawl_paths SET status = ? WHERE host = ? AND path = ? AND (status IS NULL OR status != ?)",
+  );
+  const res = await stmt.run(status, host, path, status);
+  if (res.changes === 0) {
+    return undefined;
+  }
+  return withRoot({ host, kind: "path", path, status, firstSeen: Date.now() });
+}
+
+/** True once a path has a response status (proxied or crawled) — never re-crawl it. */
+export async function isVisited(host: string, path: string): Promise<boolean> {
+  const database = requireDb();
+  const stmt = await database.prepare(
+    "SELECT 1 AS ok FROM crawl_paths WHERE host = ? AND path = ? AND status IS NOT NULL",
+  );
+  return (await stmt.get(host, path)) !== undefined;
+}
+
+/**
+ * Unvisited candidates for an active crawl: every stored path without a status,
+ * every path extracted from JS, unfetched JS files, and each host's root.
+ */
+export async function getCrawlSeeds(): Promise<Array<{ host: string; path: string }>> {
+  const database = requireDb();
+  const stmt = await database.prepare(`
+    SELECT host, path FROM crawl_paths WHERE status IS NULL
+    UNION
+    SELECT host, path FROM crawl_js_paths
+    UNION
+    SELECT host, path FROM crawl_js_files WHERE fetched = 0
+    UNION
+    SELECT host, '/' FROM (
+      SELECT host FROM crawl_paths UNION SELECT host FROM crawl_js_files
+    )
+  `);
+  return (await stmt.all()) as Array<{ host: string; path: string }>;
 }
 
 /**
@@ -235,13 +311,14 @@ export async function addJsPath(
 
 async function loadHostNode(database: Database, host: string): Promise<HostNode> {
   const pathsStmt = await database.prepare(
-    "SELECT path, method, source, first_seen FROM crawl_paths WHERE host = ? ORDER BY path COLLATE NOCASE",
+    "SELECT path, method, source, first_seen, status FROM crawl_paths WHERE host = ? ORDER BY path COLLATE NOCASE",
   );
   const pathRows = (await pathsStmt.all(host)) as Array<{
     path: string;
     method: string;
-    source: "request" | "html";
+    source: PathSource;
     first_seen: number;
+    status: number | null;
   }>;
 
   const paths: PathEntry[] = pathRows.map((r) => ({
@@ -249,6 +326,7 @@ async function loadHostNode(database: Database, host: string): Promise<HostNode>
     method: r.method,
     source: r.source,
     firstSeen: r.first_seen,
+    status: r.status ?? undefined,
   }));
 
   const jsFilesStmt = await database.prepare(
@@ -296,7 +374,8 @@ async function loadHostNode(database: Database, host: string): Promise<HostNode>
   };
 }
 
-export async function getTree(): Promise<CrawlTree> {
+/** Build the tree, keeping only hosts for which `include` returns true (scope filter). */
+export async function getTree(include: (host: string) => boolean): Promise<CrawlTree> {
   const database = requireDb();
 
   const hostsStmt = await database.prepare(`
@@ -308,7 +387,9 @@ export async function getTree(): Promise<CrawlTree> {
       SELECT host FROM crawl_referers
     ) ORDER BY host COLLATE NOCASE
   `);
-  const hostRows = (await hostsStmt.all()) as Array<{ host: string }>;
+  const hostRows = ((await hostsStmt.all()) as Array<{ host: string }>).filter((r) =>
+    include(r.host),
+  );
 
   const byRoot = new Map<string, HostNode[]>();
   let totalPaths = 0;
@@ -354,8 +435,8 @@ export async function getTree(): Promise<CrawlTree> {
 }
 
 /** Build a markdown export of the full crawl tree, grouped by root domain then host. */
-export async function exportMarkdown(): Promise<string> {
-  const tree = await getTree();
+export async function exportMarkdown(include: (host: string) => boolean): Promise<string> {
+  const tree = await getTree(include);
   const lines: string[] = [
     "# Path Crawler Export",
     "",
@@ -387,7 +468,8 @@ export async function exportMarkdown(): Promise<string> {
         lines.push("#### Paths");
         lines.push("");
         for (const p of host.paths) {
-          lines.push(`- \`${p.path}\` (${p.method}, ${p.source})`);
+          const status = p.status === undefined ? "" : `, ${p.status}`;
+          lines.push(`- \`${p.path}\` (${p.method}, ${p.source}${status})`);
         }
         lines.push("");
       }
